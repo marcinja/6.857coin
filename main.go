@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/bits"
 	"net/http"
 	"time"
 )
@@ -205,6 +206,21 @@ func computePoW(i, j uint64, seed, seed2 []byte) {
 	return
 }
 
+func hammingDistance(x, y []byte) int {
+	// go doesn't let you get an array pointer from a slice.
+	// so we just hardcode these numbers and assume x,y are 32 bytes,
+	// this way we avoid copying.
+
+	dist := 0
+	for start, end := 0, 8; end < 32; start, end = start+8, end+8 {
+		x_int := binary.BigEndian.Uint64(x[start:end])
+		y_int := binary.BigEndian.Uint64(y[start:end])
+		dist += bits.OnesCount64(x_int ^ y_int)
+	}
+
+	return dist
+}
+
 func makeNextBlock(header Header) Block {
 	newHeader := Header{
 		ParentID:   "", //TODO: SHA256 header,
@@ -239,7 +255,7 @@ func main() {
 	}
 
 	fmt.Println("SEED:L", seed)
-	//	seed2 := make([]byte, 32)
+	seed2 := make([]byte, 32)
 
 	computePoW(i, j, seed, seed)
 }
