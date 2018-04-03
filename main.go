@@ -9,17 +9,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/bits"
+	"math/rand"
 	"net/http"
+	"sync"
 	"time"
 )
 
-const TEAM_NAME = "marcinja"
+const TEAM_NAME = "marcinja, hujh"
 const NODE_URL = "http://6857coin.csail.mit.edu"
 const TIME_RANGE = 119
 const AES_BLOCK_SIZE = 16
+const MaxUint64 = 1<<64 - 1
+
+const DEBUG = false
 
 type Header struct {
-	ParentID   string    `json:"parentid`
+	ParentID   string    `json:"parentid"`
 	Root       string    `json:"root"`
 	Difficulty uint64    `json:"difficulty"`
 	Timestamp  uint64    `json:"timestamp"`
@@ -43,25 +48,17 @@ type ExplorerBlock struct {
 	Timestamp     time.Time `json:"timestamp"`
 }
 
-func nextBlock() (bool, Header) {
+func nextBlockTemplate() (Header, bool) {
 	resp, err := http.Get(NODE_URL + "/next")
 	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
 		fmt.Println("Failed to get block", err)
-		return false, Header{}
+		return Header{}, false
 	}
 	defer resp.Body.Close()
 
 	header := Header{}
 	json.NewDecoder(resp.Body).Decode(&header)
-	return true, header
-
-	/*
-			b, _ := json.Marshal(&header)
-			buf := bytes.NewBuffer(b)
-			header2 := Header{}
-			json.NewDecoder(buf).Decode(&header2)
-		fmt.Println(header, b, header2)
-	*/
+	return header, true
 }
 
 func addBlock(block Block) bool {
@@ -79,29 +76,10 @@ func addBlock(block Block) bool {
 	return true
 }
 
-func test1() {
-	t := "/block/d127746e056fa60278353a19ba090b04c021855e56e136c915778eff1f5afdfa"
-	resp, err := http.Get(NODE_URL + t)
-	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
-		fmt.Println("Failed to get block", err)
-	}
-	defer resp.Body.Close()
-
-	block := ExplorerBlock{}
-	json.NewDecoder(resp.Body).Decode(&block)
-
-	fmt.Println(block.ID)
-
-	s := hashBlockHeader(&block.Header)
-	fmt.Println(s)
-}
-
 // return SHA256 hash of header.
 func hashBlockHeader(header *Header) []byte {
-	// TODO fix size to 32 and do copies instead?
 	b := make([]byte, 0)
 	h := sha256.New()
-	//	b, _ := json.Marshal(&header)
 
 	id, _ := hex.DecodeString(header.ParentID)
 	b = append(b, id[:]...)
@@ -128,8 +106,6 @@ func hashBlockHeader(header *Header) []byte {
 	h.Write(b)
 	sum := h.Sum(nil)
 
-	//return hex.EncodeToString(sum)
-	fmt.Println(hex.EncodeToString(sum))
 	return sum
 }
 
@@ -169,8 +145,30 @@ func getSeeds(header *Header) ([]byte, []byte) {
 	return seed, seed2
 }
 
+type uint128 struct {
+	low  uint64
+	high uint64
+}
+
+func Add(x, y uint128) uint128 {
+	z := uint128{}
+	z.high = x.high + y.high
+	z.low = x.low + y.low
+
+	// If low bits sum overflows, add carry bit to high.
+	if z.low < x.low {
+		z.high++
+	}
+
+	return z
+}
+
+func HammingDistance(x, y uint128) int {
+	return bits.OnesCount64(x.low^y.low) + bits.OnesCount64(x.high^y.high)
+}
+
 // TODO: check errors like a reasonable human being
-func computePoW(i, j uint64, seed, seed2 []byte) {
+func computePoW(i, j uint64, seed, seed2 []byte) int {
 	seedCipher, _ := aes.NewCipher(seed)
 	seed2Cipher, _ := aes.NewCipher(seed2)
 
@@ -184,41 +182,53 @@ func computePoW(i, j uint64, seed, seed2 []byte) {
 	B_j_p := make([]byte, 16)
 	binary.BigEndian.PutUint64(B_j_p[8:], j)
 
+	//fmt.Println("\n plain: \n", A_i_p, A_j_p, B_i_p, B_j_p)
+	//fmt.Println(seed, seed2)
+
 	// Ciphertexts:
 	A_i := make([]byte, 16)
 	seedCipher.Encrypt(A_i, A_i_p)
-
 	A_j := make([]byte, 16)
 	seedCipher.Encrypt(A_j, A_j_p)
-
 	B_i := make([]byte, 16)
-	seedCipher.Encrypt(B_i, B_i_p)
-
+	seed2Cipher.Encrypt(B_i, B_i_p)
 	B_j := make([]byte, 16)
 	seed2Cipher.Encrypt(B_j, B_j_p)
 
-	fmt.Println("CIPHERS")
-	fmt.Println(hex.EncodeToString(seed))
-	fmt.Println(hex.EncodeToString(A_j))
-	fmt.Println(hex.EncodeToString(B_i))
-	fmt.Println(hex.EncodeToString(B_j))
+	//fmt.Println("CIPHERS: \n", A_i, A_j, B_i, B_j)
 
-	return
+	A_i_int128 := uint128{
+		low:  binary.BigEndian.Uint64(A_i[0:8]),
+		high: binary.BigEndian.Uint64(A_i[8:16]),
+	}
+
+	A_j_int128 := uint128{
+		low:  binary.BigEndian.Uint64(A_j[0:8]),
+		high: binary.BigEndian.Uint64(A_j[8:16]),
+	}
+	B_i_int128 := uint128{
+		low:  binary.BigEndian.Uint64(B_i[0:8]),
+		high: binary.BigEndian.Uint64(B_i[8:16]),
+	}
+
+	B_j_int128 := uint128{
+		low:  binary.BigEndian.Uint64(B_j[0:8]),
+		high: binary.BigEndian.Uint64(B_j[8:16]),
+	}
+
+	return HammingDistance(Add(A_i_int128, B_j_int128), Add(A_j_int128, B_i_int128))
 }
 
 func hammingDistance(x, y []byte) int {
 	// go doesn't let you get an array pointer from a slice.
 	// so we just hardcode these numbers and assume x,y are 32 bytes,
 	// this way we avoid copying.
+	x_int := binary.BigEndian.Uint64(x[0:8])
+	x_int2 := binary.BigEndian.Uint64(x[8:16])
 
-	dist := 0
-	for start, end := 0, 8; end < 32; start, end = start+8, end+8 {
-		x_int := binary.BigEndian.Uint64(x[start:end])
-		y_int := binary.BigEndian.Uint64(y[start:end])
-		dist += bits.OnesCount64(x_int ^ y_int)
-	}
-
-	return dist
+	y_int := binary.BigEndian.Uint64(y[0:8])
+	y_int2 := binary.BigEndian.Uint64(y[8:16])
+	return bits.OnesCount64(x_int^y_int) + bits.OnesCount64(x_int2^y_int2)
 }
 
 func makeNextBlock(header Header) Block {
@@ -246,16 +256,84 @@ func main() {
 	//	addBlock(Block{})
 	test1()
 
-	i := uint64(999999999999)
-	j := uint64(999999999998)
+}
 
-	seed := make([]byte, 32)
-	for i := 0; i < 32; i++ {
-		seed[i] = 0x30
+func test1() {
+	// Genesis block
+	//t := "/block/d127746e056fa60278353a19ba090b04c021855e56e136c915778eff1f5afdfa"
+
+	//	t := "/block/1daf4834bb21c214cf6df62046533963d8d1058b6b327b248541b621af4ce582"
+
+	t := "/block/d127746e056fa60278353a19ba090b04c021855e56e136c915778eff1f5afdfa"
+	resp, err := http.Get(NODE_URL + t)
+	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
+		fmt.Println("Failed to get block", err)
+	}
+	defer resp.Body.Close()
+
+	block := ExplorerBlock{}
+	json.NewDecoder(resp.Body).Decode(&block)
+
+	s := hashBlockHeader(&block.Header)
+	fmt.Println(s)
+
+	seed, seed2 := getSeeds(&block.Header)
+	/*
+		for i := 1; i < MaxUint64/4; i++ {
+			for j := 1; j < MaxUint64/4; j++ {
+				work := computePoW(uint64(i), uint64(j), seed, seed2)
+				fmt.Println(i, j, work)
+				if 128-94 >= work {
+					fmt.Println(i, j, work)
+					break
+				}
+			}
+		}
+	*/
+	work := computePoW(199952, 12, seed, seed2)
+
+	fmt.Println("seeds and work", seed, seed2, 128-86, work)
+	fmt.Println(block)
+}
+
+// Maximum number of elements stored for A and B.
+const MAX_TABLE_SIZE = 1000
+
+// Number of goroutines that will be mining.
+const N_WORKERS = 4
+
+type Miner struct {
+	mu           sync.Mutex
+	currentBlock Block // currentBlock is the block being mined.
+	A_table      [MAX_TABLE_SIZE]uint128
+	B_table      [MAX_TABLE_SIZE]uint128
+}
+
+func (*Miner) SetNewBlockTemplate() {
+	headerTemplate, ok := nextBlockTemplate()
+	if !ok {
+		fmt.Println("ERR TODO: REMOVE THIS")
+		return
 	}
 
-	fmt.Println("SEED:L", seed)
-	seed2 := make([]byte, 32)
+	// Create block for miner
+	block := Block{
+		Header: headerTemplate,
+		Block:  TEAM_NAME,
+	}
+	randNonce := rand.Uint64()
+	block.Header.Nonces[0] = randNonce
+}
 
-	computePoW(i, j, seed, seed)
+func MakeMiner() *Miner {
+	m := Miner{}
+	m.SetNewBlockTemplate()
+
+	go m.Mine()
+
+	return &m
+}
+
+func (*Miner) Mine() {
+
 }
