@@ -71,7 +71,7 @@ func addBlock(block Block) bool {
 		return false
 	}
 
-	fmt.Println(resp.Body, block)
+	//fmt.Println(resp.Body, block)
 
 	return true
 }
@@ -248,7 +248,7 @@ func hammingDistance(x, y []byte) int {
 	return bits.OnesCount64(x_int^y_int) + bits.OnesCount64(x_int2^y_int2)
 }
 func currentTime() uint64 {
-	return uint64(time.Now().Unix())
+	return uint64(time.Now().UnixNano())
 }
 func test1() {
 	// Genesis block
@@ -289,24 +289,24 @@ func test1() {
 }
 
 // Maximum number of elements stored for A and B.
-const MAX_TABLE_SIZE = 15000
+const MAX_TABLE_SIZE = 50000
 
 // Number of goroutines that will be mining.
-const N_WORKERS = 4
+const N_WORKERS = 8
+const N_NONCES = MaxUint64 / N_WORKERS
 
 type Miner struct {
 	mu           sync.Mutex
 	currentBlock Block // currentBlock is the block being mined.
 	newBlockChan chan Block
 
-	A_table [MAX_TABLE_SIZE]uint128
-	B_table [MAX_TABLE_SIZE]uint128
+	A_memo sync.Map
+	B_memo sync.Map
 
-	A_memo [MAX_TABLE_SIZE]bool
-	B_memo [MAX_TABLE_SIZE]bool
+	A_size int
+	B_size int
 
-	A_table_filled bool
-	B_table_filled bool
+	start time.Time
 }
 
 func (m *Miner) SetNewBlockTemplate() {
@@ -316,26 +316,35 @@ func (m *Miner) SetNewBlockTemplate() {
 		return
 	}
 
+	fmt.Printf("%+v\n", headerTemplate)
 	// Create block for miner
 	block := Block{
 		Header: headerTemplate,
 		Block:  TEAM_NAME,
 	}
+
+	// Create block for miner
 	randNonce := rand.Uint64()
 	block.Header.Nonces[0] = randNonce
 	block.Header.Timestamp = currentTime()
+
+	m.currentBlock = block
+	fmt.Printf("%+v\n", block)
 }
 
 func MakeMiner() {
 	m := Miner{}
 	m.SetNewBlockTemplate()
 	m.newBlockChan = make(chan Block, 1)
+	m.start = time.Now()
 
+	go m.PollServer()
 	m.Mine(m.currentBlock)
 }
 
 func (m *Miner) Mine(block Block) {
-	fmt.Println("stuff")
+	fmt.Println("MINING")
+	fmt.Printf("BLOCK: %+v\n ", block)
 	killChans := make([]chan struct{}, N_WORKERS)
 	successChan := make(chan struct{}, N_WORKERS) // TODO: make it so we continue mining on our chain greedily.
 
@@ -344,9 +353,9 @@ func (m *Miner) Mine(block Block) {
 	}
 
 	// Iterate over partitions of nonce_space and assign workers.
-	nNoncesPerWorker := (MaxUint64 / N_WORKERS)
 	for i := 0; i < N_WORKERS; i++ {
-		go m.MineRange(i*nNoncesPerWorker, (i+1)*nNoncesPerWorker, killChans[i], successChan)
+		fmt.Println("RANGE: ", uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
+		go m.MineRange(uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, killChans[i], successChan)
 	}
 
 	for {
@@ -368,67 +377,22 @@ func (m *Miner) Mine(block Block) {
 	}
 }
 
-func (m *Miner) MineRange(start, end int, kill, success chan struct{}) {
-	seed, seed2 := getSeeds(&m.currentBlock.Header)
-
-	for i := start; i < (start + (MaxUint64 / N_WORKERS)); i++ {
-		for j := start; j < (start + (MaxUint64 / N_WORKERS)); j++ {
-			var A_i, A_j, B_i, B_j uint128
-			if m.A_memo[i] {
-				A_i = m.A_table[i]
-			} else {
-				A_i = SeededAES(seed, uint64(i))
-				m.A_table[i] = A_i
-				m.A_memo[i] = true
-			}
-
-			if m.A_memo[j] {
-				A_j = m.A_table[j]
-			} else {
-				A_j = SeededAES(seed, uint64(j))
-				m.A_table[j] = A_j
-				m.A_memo[j] = true
-			}
-
-			if m.B_memo[i] {
-				B_i = m.B_table[i]
-			} else {
-				B_i = SeededAES(seed2, uint64(i))
-				m.B_table[i] = B_i
-				m.B_memo[i] = true
-			}
-
-			if m.B_memo[j] {
-				B_j = m.B_table[j]
-			} else {
-				B_j = SeededAES(seed2, uint64(j))
-				m.B_table[j] = B_j
-				m.B_memo[j] = true
-			}
-
-			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
-
-			fmt.Println("DIST: ", dist)
-
-			if dist <= 128-int(m.currentBlock.Header.Difficulty) {
-				fmt.Println("DONE")
-				m.currentBlock.Header.Nonces[1] = uint64(i)
-				m.currentBlock.Header.Nonces[2] = uint64(j)
-				if ok := addBlock(m.currentBlock); ok {
-					success <- struct{}{}
-				}
-			}
-		}
-	}
-}
-
 const POLLING_TIMEOUT = 100 * time.Millisecond
 
 // Poll server for new block templates (i.e. check if another block has been mined.)
 // Runs in one goroutine only.
 func (m *Miner) PollServer() {
 	for {
+		//fmt.Println("TABLES SIZES: ", m.A_size, m.B_size)
 		h, ok := nextBlockTemplate()
+
+		q := 10
+		p := 1
+		i := rand.Intn(q)
+		if i < p {
+			fmt.Println(h.ParentID, 128-h.Difficulty, m.currentBlock.Header.Timestamp)
+		}
+
 		if !ok {
 			// TODO decide on what behavior is reasonable here
 			continue
@@ -453,9 +417,77 @@ func (m *Miner) PollServer() {
 func main() {
 	//nextBlock()
 	//	addBlock(Block{})
-	test1()
+	//test1()
+
+	h, _ := nextBlockTemplate()
+	fmt.Printf("%+v\n", h)
 
 	fmt.Println("\n\nMINING COMMENCES")
 
 	MakeMiner()
+}
+
+func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
+	seed, seed2 := getSeeds(&m.currentBlock.Header)
+
+	done := false
+
+	for i := start; i < end; i++ {
+		//fmt.Println("mining nonce: ", i)
+		// Compute A(i), B(i) (since this is our nonce-range).
+		// If tables aren't filled up, we will add them to the tables after.
+		A_i := SeededAES(seed, uint64(i))
+		B_i := SeededAES(seed2, uint64(i))
+
+		checkAgainstA_Tables := func(j, v interface{}) bool {
+			//			fmt.Println("\nRANGE: ", j)
+			A_j := v.(uint128)
+
+			B_j_e, ok := m.B_memo.Load(j)
+			if !ok {
+				return true
+			}
+			B_j := B_j_e.(uint128)
+
+			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
+
+			if dist < 35 {
+				fmt.Println("DIST: ", dist)
+				fmt.Println(time.Since(m.start))
+			}
+
+			if dist <= 128-int(m.currentBlock.Header.Difficulty) {
+				m.mu.Lock()
+				m.currentBlock.Header.Nonces[1] = uint64(i)
+				m.currentBlock.Header.Nonces[2] = j.(uint64)
+				ok := addBlock(m.currentBlock)
+				fmt.Println(m.currentBlock)
+				m.mu.Unlock()
+
+				if ok {
+					success <- struct{}{}
+				}
+
+				done = true
+			}
+
+			return true
+		}
+
+		m.A_memo.Range(checkAgainstA_Tables)
+
+		// Insert into memo table now.
+		if (m.A_size <= MAX_TABLE_SIZE) && (m.B_size <= MAX_TABLE_SIZE) {
+			m.A_memo.Store(i, A_i)
+			m.B_memo.Store(i, B_i)
+			m.mu.Lock()
+			m.A_size++
+			m.B_size++
+			m.mu.Unlock()
+		}
+
+		if done {
+			return
+		}
+	}
 }
