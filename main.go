@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const TEAM_NAME = "marcinja, hujh"
+const TEAM_NAME = "marcinja, hujh, test"
 const NODE_URL = "http://6857coin.csail.mit.edu"
 const TIME_RANGE = 119
 const AES_BLOCK_SIZE = 16
@@ -65,14 +65,12 @@ func addBlock(block Block) bool {
 	b, _ := json.Marshal(&block)
 	buf := bytes.NewBuffer(b)
 
-	resp, err := http.Post(NODE_URL, "/add", buf)
+	fmt.Println(string(b))
+	resp, err := http.Post(NODE_URL+"/add", "", buf)
+	defer resp.Body.Close()
 	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
-		fmt.Println("Add block failed", err, resp.StatusCode)
-		return false
+		fmt.Println("Add block failed", err, resp)
 	}
-
-	//fmt.Println(resp.Body, block)
-
 	return true
 }
 
@@ -203,7 +201,7 @@ func currentTime() uint64 {
 const MAX_TABLE_SIZE = 25000
 
 // Number of goroutines that will be mining.
-const N_WORKERS = 4
+const N_WORKERS = 12
 const N_NONCES = MaxUint64 / N_WORKERS
 
 type Miner struct {
@@ -237,6 +235,13 @@ func (m *Miner) SetNewBlockTemplate() {
 	randNonce := rand.Uint64()
 	block.Header.Nonces[0] = randNonce
 	block.Header.Timestamp = currentTime()
+
+	contents := []byte(TEAM_NAME)
+	h := sha256.New()
+	h.Write(contents)
+	root := h.Sum(nil)
+
+	block.Header.Root = hex.EncodeToString(root)
 
 	m.currentBlock = block
 }
@@ -358,7 +363,9 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 				fmt.Println("nonces checked", num_checked, time.Since(m.start), id)
 			}
 
-			if dist <= 128-int(m.currentBlock.Header.Difficulty) {
+			if dist < 128-int(m.currentBlock.Header.Difficulty) {
+				fmt.Println("dif:, ", 128-int(m.currentBlock.Header.Difficulty))
+				fmt.Println("DIST: ", dist, time.Since(m.start))
 				m.mu.Lock()
 				m.currentBlock.Header.Nonces[1] = uint64(i)
 				m.currentBlock.Header.Nonces[2] = j.(uint64)
@@ -392,4 +399,29 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 			return
 		}
 	}
+}
+
+func testPoW() {
+	id := "a367b8d21c4263baa65e22da2faf52a42ac72f1d02d900473cecfcd40084b163"
+	resp, err := http.Get("http://6857coin.csail.mit.edu/block/" + id)
+	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
+		fmt.Println("Failed to get block", err)
+	}
+	defer resp.Body.Close()
+
+	b := ExplorerBlock{}
+	json.NewDecoder(resp.Body).Decode(&b)
+
+	fmt.Println(b, id)
+
+	seed, seed2 := getSeeds(&b.Header)
+	A_i := SeededAES(seed, b.Header.Nonces[1])
+	B_i := SeededAES(seed2, b.Header.Nonces[1])
+
+	A_j := SeededAES(seed, b.Header.Nonces[2])
+	B_j := SeededAES(seed2, b.Header.Nonces[2])
+
+	dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
+
+	fmt.Println(dist)
 }
