@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const TEAM_NAME = "marcinja, hujh, test"
+const TEAM_NAME = "marcinja, hujh"
 const NODE_URL = "http://6857coin.csail.mit.edu"
 const TIME_RANGE = 119
 const AES_BLOCK_SIZE = 16
@@ -216,6 +216,8 @@ type Miner struct {
 	B_size int
 
 	start time.Time
+
+	killChans []chan struct{}
 }
 
 func (m *Miner) SetNewBlockTemplate() {
@@ -246,51 +248,68 @@ func (m *Miner) SetNewBlockTemplate() {
 	m.currentBlock = block
 }
 
-func MakeMiner() {
-	m := Miner{}
+func (m *Miner) SetupMiner() {
 	m.SetNewBlockTemplate()
 	m.newBlockChan = make(chan Block, 1)
 	m.start = time.Now()
 
-	go m.PollServer()
-	m.Mine(m.currentBlock)
-}
-
-func (m *Miner) Mine(block Block) {
-	fmt.Printf("MINING BLOCK: %+v\n\n ", block)
-	killChans := make([]chan struct{}, N_WORKERS)
-	successChan := make(chan struct{}, N_WORKERS) // TODO: make it so we continue mining on our chain greedily.
+	m.killChans = make([]chan struct{}, N_WORKERS)
 
 	for i := 0; i < N_WORKERS; i++ {
-		killChans[i] = make(chan struct{}, 1)
+		m.killChans[i] = make(chan struct{}, 1)
 	}
+}
 
+func StartMiner(m Miner) {
+	m.SetupMiner()
+	go m.PollServer()
+	m.SendTasks()
+	m.MasterLoop()
+}
+
+func (m *Miner) SendTasks() {
+	fmt.Printf("MINING BLOCK: %+v\n\n ", m.currentBlock)
 	// Iterate over partitions of nonce_space and assign workers.
 	for i := 0; i < N_WORKERS; i++ {
 		fmt.Println("NONCE RANGE: ", i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
-		go m.MineRange(uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, killChans[i], successChan)
+		go m.MineRange(uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, m.killChans[i])
 	}
+
+}
+
+func (m *Miner) MasterLoop() {
+	// Timeout needed to update timestamp.
+	timestamp_timeout := 119 * time.Second
+	timeout := time.NewTimer(timestamp_timeout)
 
 	for {
 		select {
-		case newBlock := <-m.newBlockChan:
+		case <-m.newBlockChan:
+			fmt.Println("\n~~~ NEW BLOCK FOUND ~~~")
 			m.mu.Lock()
-			defer m.mu.Unlock()
 			for i := 0; i < N_WORKERS; i++ {
-				killChans[i] <- struct{}{}
+				m.killChans[i] <- struct{}{}
 			}
+			m.SetupMiner()
+			m.SendTasks()
+			m.mu.Unlock()
+			timeout.Reset(timestamp_timeout)
 
-			go m.Mine(newBlock)
-			return
-
-		case <-successChan:
-			// wait for poll server to let you know? TODO
-			time.Sleep(POLLING_TIMEOUT)
+		case <-timeout.C:
+			fmt.Println("\n~~~TIMEOUT EXCEEDED~~~")
+			m.mu.Lock()
+			for i := 0; i < N_WORKERS; i++ {
+				m.killChans[i] <- struct{}{}
+			}
+			m.SetupMiner()
+			m.SendTasks()
+			m.mu.Unlock()
+			timeout.Reset(timestamp_timeout)
 		}
 	}
 }
 
-const POLLING_TIMEOUT = 500 * time.Millisecond
+const POLLING_TIMEOUT = 250 * time.Millisecond
 
 // Poll server for new block templates (i.e. check if another block has been mined.)
 // Runs in one goroutine only.
@@ -328,10 +347,10 @@ func (m *Miner) PollServer() {
 }
 
 func main() {
-	MakeMiner()
+	StartMiner(Miner{})
 }
 
-func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
+func (m *Miner) MineRange(start, end uint64, kill chan struct{}) {
 	seed, seed2 := getSeeds(&m.currentBlock.Header)
 
 	done := false
@@ -340,6 +359,12 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 	id := rand.Uint64()
 
 	for i := start; i < end; i++ {
+		select {
+		case <-kill:
+			return
+		default:
+		}
+
 		//fmt.Println("mining nonce: ", i)
 		// Compute A(i), B(i) (since this is our nonce-range).
 		// If tables aren't filled up, we will add them to the tables after.
@@ -358,7 +383,7 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
 
 			num_checked++
-			if dist < 35 {
+			if dist < 33 {
 				fmt.Println("DIST: ", dist, time.Since(m.start))
 				fmt.Println("nonces checked", num_checked, time.Since(m.start), id)
 			}
@@ -369,14 +394,9 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 				m.mu.Lock()
 				m.currentBlock.Header.Nonces[1] = uint64(i)
 				m.currentBlock.Header.Nonces[2] = j.(uint64)
-				ok := addBlock(m.currentBlock)
+				addBlock(m.currentBlock)
 				fmt.Println(m.currentBlock)
 				m.mu.Unlock()
-
-				if ok {
-					success <- struct{}{}
-				}
-
 				done = true
 			}
 
