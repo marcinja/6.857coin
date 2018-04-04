@@ -184,58 +184,6 @@ func SeededAES(seed []byte, i uint64) uint128 {
 	return A_i_int128
 }
 
-// TODO: check errors like a reasonable human being
-func computePoW(i, j uint64, seed, seed2 []byte) int {
-	seedCipher, _ := aes.NewCipher(seed)
-	seed2Cipher, _ := aes.NewCipher(seed2)
-
-	// Plaintexts:
-	A_i_p := make([]byte, 16)
-	binary.BigEndian.PutUint64(A_i_p[8:], i)
-	A_j_p := make([]byte, 16)
-	binary.BigEndian.PutUint64(A_j_p[8:], j)
-	B_i_p := make([]byte, 16)
-	binary.BigEndian.PutUint64(B_i_p[8:], i)
-	B_j_p := make([]byte, 16)
-	binary.BigEndian.PutUint64(B_j_p[8:], j)
-
-	//fmt.Println("\n plain: \n", A_i_p, A_j_p, B_i_p, B_j_p)
-	//fmt.Println(seed, seed2)
-
-	// Ciphertexts:
-	A_i := make([]byte, 16)
-	seedCipher.Encrypt(A_i, A_i_p)
-	A_j := make([]byte, 16)
-	seedCipher.Encrypt(A_j, A_j_p)
-	B_i := make([]byte, 16)
-	seed2Cipher.Encrypt(B_i, B_i_p)
-	B_j := make([]byte, 16)
-	seed2Cipher.Encrypt(B_j, B_j_p)
-
-	//fmt.Println("CIPHERS: \n", A_i, A_j, B_i, B_j)
-
-	A_i_int128 := uint128{
-		low:  binary.BigEndian.Uint64(A_i[0:8]),
-		high: binary.BigEndian.Uint64(A_i[8:16]),
-	}
-
-	A_j_int128 := uint128{
-		low:  binary.BigEndian.Uint64(A_j[0:8]),
-		high: binary.BigEndian.Uint64(A_j[8:16]),
-	}
-	B_i_int128 := uint128{
-		low:  binary.BigEndian.Uint64(B_i[0:8]),
-		high: binary.BigEndian.Uint64(B_i[8:16]),
-	}
-
-	B_j_int128 := uint128{
-		low:  binary.BigEndian.Uint64(B_j[0:8]),
-		high: binary.BigEndian.Uint64(B_j[8:16]),
-	}
-
-	return HammingDistance(Add(A_i_int128, B_j_int128), Add(A_j_int128, B_i_int128))
-}
-
 func hammingDistance(x, y []byte) int {
 	// go doesn't let you get an array pointer from a slice.
 	// so we just hardcode these numbers and assume x,y are 32 bytes,
@@ -249,43 +197,6 @@ func hammingDistance(x, y []byte) int {
 }
 func currentTime() uint64 {
 	return uint64(time.Now().UnixNano())
-}
-func test1() {
-	// Genesis block
-	//t := "/block/d127746e056fa60278353a19ba090b04c021855e56e136c915778eff1f5afdfa"
-
-	//	t := "/block/1daf4834bb21c214cf6df62046533963d8d1058b6b327b248541b621af4ce582"
-
-	t := "/block/d127746e056fa60278353a19ba090b04c021855e56e136c915778eff1f5afdfa"
-	resp, err := http.Get(NODE_URL + t)
-	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
-		fmt.Println("Failed to get block", err)
-	}
-	defer resp.Body.Close()
-
-	block := ExplorerBlock{}
-	json.NewDecoder(resp.Body).Decode(&block)
-
-	s := hashBlockHeader(&block.Header)
-	fmt.Println(s)
-
-	seed, seed2 := getSeeds(&block.Header)
-	/*
-		for i := 1; i < MaxUint64/4; i++ {
-			for j := 1; j < MaxUint64/4; j++ {
-				work := computePoW(uint64(i), uint64(j), seed, seed2)
-				fmt.Println(i, j, work)
-				if 128-94 >= work {
-					fmt.Println(i, j, work)
-					break
-				}
-			}
-		}
-	*/
-	work := computePoW(199952, 12, seed, seed2)
-
-	fmt.Println("seeds and work", seed, seed2, 128-86, work)
-	fmt.Println(block)
 }
 
 // Maximum number of elements stored for A and B.
@@ -316,7 +227,6 @@ func (m *Miner) SetNewBlockTemplate() {
 		return
 	}
 
-	fmt.Printf("%+v\n", headerTemplate)
 	// Create block for miner
 	block := Block{
 		Header: headerTemplate,
@@ -329,7 +239,6 @@ func (m *Miner) SetNewBlockTemplate() {
 	block.Header.Timestamp = currentTime()
 
 	m.currentBlock = block
-	fmt.Printf("%+v\n", block)
 }
 
 func MakeMiner() {
@@ -343,8 +252,7 @@ func MakeMiner() {
 }
 
 func (m *Miner) Mine(block Block) {
-	fmt.Println("MINING")
-	fmt.Printf("BLOCK: %+v\n ", block)
+	fmt.Printf("MINING BLOCK: %+v\n\n ", block)
 	killChans := make([]chan struct{}, N_WORKERS)
 	successChan := make(chan struct{}, N_WORKERS) // TODO: make it so we continue mining on our chain greedily.
 
@@ -354,7 +262,7 @@ func (m *Miner) Mine(block Block) {
 
 	// Iterate over partitions of nonce_space and assign workers.
 	for i := 0; i < N_WORKERS; i++ {
-		fmt.Println("RANGE: ", uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
+		fmt.Println("NONCE RANGE: ", i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
 		go m.MineRange(uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, killChans[i], successChan)
 	}
 
@@ -390,7 +298,7 @@ func (m *Miner) PollServer() {
 		p := 1
 		i := rand.Intn(q)
 		if i < p {
-			fmt.Println("Parent ID, matching num: ", h.ParentID, 128-h.Difficulty, m.A_size)
+			fmt.Println("Parent ID, matching num, A_size: ", h.ParentID, 128-h.Difficulty, m.A_size)
 		}
 
 		if !ok {
@@ -415,15 +323,6 @@ func (m *Miner) PollServer() {
 }
 
 func main() {
-	//nextBlock()
-	//	addBlock(Block{})
-	//test1()
-
-	h, _ := nextBlockTemplate()
-	fmt.Printf("%+v\n", h)
-
-	fmt.Println("\n\nMINING COMMENCES")
-
 	MakeMiner()
 }
 
@@ -443,7 +342,6 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 		B_i := SeededAES(seed2, uint64(i))
 
 		checkAgainstA_Tables := func(j, v interface{}) bool {
-			//	fmt.Println("\nRANGE: ", i, j)
 			A_j := v.(uint128)
 
 			B_j_e, ok := m.B_memo.Load(j)
@@ -480,9 +378,6 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 
 		m.A_memo.Range(checkAgainstA_Tables)
 
-		if num_checked > 250000 {
-			fmt.Println("nonces checked", num_checked, time.Since(m.start), id)
-		}
 		// Insert into memo table now.
 		if (m.A_size <= MAX_TABLE_SIZE) && (m.B_size <= MAX_TABLE_SIZE) {
 			m.A_memo.Store(i, A_i)
