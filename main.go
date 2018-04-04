@@ -289,10 +289,10 @@ func test1() {
 }
 
 // Maximum number of elements stored for A and B.
-const MAX_TABLE_SIZE = 50000
+const MAX_TABLE_SIZE = 25000
 
 // Number of goroutines that will be mining.
-const N_WORKERS = 8
+const N_WORKERS = 4
 const N_NONCES = MaxUint64 / N_WORKERS
 
 type Miner struct {
@@ -377,7 +377,7 @@ func (m *Miner) Mine(block Block) {
 	}
 }
 
-const POLLING_TIMEOUT = 100 * time.Millisecond
+const POLLING_TIMEOUT = 500 * time.Millisecond
 
 // Poll server for new block templates (i.e. check if another block has been mined.)
 // Runs in one goroutine only.
@@ -386,11 +386,11 @@ func (m *Miner) PollServer() {
 		//fmt.Println("TABLES SIZES: ", m.A_size, m.B_size)
 		h, ok := nextBlockTemplate()
 
-		q := 10
+		q := 25
 		p := 1
 		i := rand.Intn(q)
 		if i < p {
-			fmt.Println(h.ParentID, 128-h.Difficulty, m.currentBlock.Header.Timestamp)
+			fmt.Println("Parent ID, matching num: ", h.ParentID, 128-h.Difficulty, m.A_size)
 		}
 
 		if !ok {
@@ -432,6 +432,9 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 
 	done := false
 
+	num_checked := 0
+	id := rand.Uint64()
+
 	for i := start; i < end; i++ {
 		//fmt.Println("mining nonce: ", i)
 		// Compute A(i), B(i) (since this is our nonce-range).
@@ -440,7 +443,7 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 		B_i := SeededAES(seed2, uint64(i))
 
 		checkAgainstA_Tables := func(j, v interface{}) bool {
-			//			fmt.Println("\nRANGE: ", j)
+			//	fmt.Println("\nRANGE: ", i, j)
 			A_j := v.(uint128)
 
 			B_j_e, ok := m.B_memo.Load(j)
@@ -451,9 +454,10 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 
 			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
 
+			num_checked++
 			if dist < 35 {
-				fmt.Println("DIST: ", dist)
-				fmt.Println(time.Since(m.start))
+				fmt.Println("DIST: ", dist, time.Since(m.start))
+				fmt.Println("nonces checked", num_checked, time.Since(m.start), id)
 			}
 
 			if dist <= 128-int(m.currentBlock.Header.Difficulty) {
@@ -476,6 +480,9 @@ func (m *Miner) MineRange(start, end uint64, kill, success chan struct{}) {
 
 		m.A_memo.Range(checkAgainstA_Tables)
 
+		if num_checked > 250000 {
+			fmt.Println("nonces checked", num_checked, time.Since(m.start), id)
+		}
 		// Insert into memo table now.
 		if (m.A_size <= MAX_TABLE_SIZE) && (m.B_size <= MAX_TABLE_SIZE) {
 			m.A_memo.Store(i, A_i)
