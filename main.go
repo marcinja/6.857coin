@@ -11,6 +11,8 @@ import (
 	"math/bits"
 	"math/rand"
 	"net/http"
+	"os"
+	"runtime/pprof"
 	"sync"
 	"time"
 )
@@ -22,6 +24,7 @@ const AES_BLOCK_SIZE = 16
 const MaxUint64 = 1<<64 - 1
 
 const DEBUG = false
+const GET_RATE = true
 
 type Header struct {
 	ParentID   string    `json:"parentid"`
@@ -165,7 +168,22 @@ func HammingDistance(x, y uint128) int {
 	return bits.OnesCount64(x.low^y.low) + bits.OnesCount64(x.high^y.high)
 }
 
-func SeededAES(seed []byte, i uint64) uint128 {
+func SeededAES(m_buffer, c_buffer, seed []byte, i uint64) uint128 {
+	cipher, _ := aes.NewCipher(seed)
+
+	binary.BigEndian.PutUint64(m_buffer[8:], i)
+	cipher.Encrypt(c_buffer, m_buffer)
+
+	A_i_int128 := uint128{
+		low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+		high: binary.BigEndian.Uint64(c_buffer[8:16]),
+	}
+
+	return A_i_int128
+}
+
+// too many allocs :(
+func SeededAES_Old(seed []byte, i uint64) uint128 {
 	cipher, _ := aes.NewCipher(seed)
 
 	A_i_p := make([]byte, 16)
@@ -201,7 +219,7 @@ func currentTime() uint64 {
 const MAX_TABLE_SIZE = 25000
 
 // Number of goroutines that will be mining.
-const N_WORKERS = 12
+const N_WORKERS = 4
 const N_NONCES = MaxUint64 / N_WORKERS
 
 type Miner struct {
@@ -217,7 +235,8 @@ type Miner struct {
 
 	start time.Time
 
-	killChans []chan struct{}
+	killChans    []chan struct{}
+	pairsChecked []int
 }
 
 func (m *Miner) SetNewBlockTemplate() {
@@ -254,6 +273,7 @@ func (m *Miner) SetupMiner() {
 	m.start = time.Now()
 
 	m.killChans = make([]chan struct{}, N_WORKERS)
+	m.pairsChecked = make([]int, N_WORKERS)
 
 	for i := 0; i < N_WORKERS; i++ {
 		m.killChans[i] = make(chan struct{}, 1)
@@ -272,7 +292,7 @@ func (m *Miner) SendTasks() {
 	// Iterate over partitions of nonce_space and assign workers.
 	for i := 0; i < N_WORKERS; i++ {
 		fmt.Println("NONCE RANGE: ", i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
-		go m.MineRange(uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, m.killChans[i])
+		go m.MineRange(i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, m.killChans[i])
 	}
 
 }
@@ -282,9 +302,15 @@ func (m *Miner) MasterLoop() {
 	timestamp_timeout := 119 * time.Second
 	timeout := time.NewTimer(timestamp_timeout)
 
+	start := time.Now()
+
 	for {
 		select {
 		case <-m.newBlockChan:
+			if GET_RATE {
+				continue
+			}
+
 			fmt.Println("\n~~~ NEW BLOCK FOUND ~~~")
 			m.mu.Lock()
 			for i := 0; i < N_WORKERS; i++ {
@@ -299,8 +325,19 @@ func (m *Miner) MasterLoop() {
 			fmt.Println("\n~~~TIMEOUT EXCEEDED~~~")
 			m.mu.Lock()
 			for i := 0; i < N_WORKERS; i++ {
+				fmt.Println(i)
 				m.killChans[i] <- struct{}{}
 			}
+
+			if GET_RATE {
+				total := 0
+				for i := 0; i < N_WORKERS; i++ {
+					total += m.pairsChecked[i]
+				}
+				fmt.Println("\n\n TOTAL CHECKED after TIME: ", total, time.Since(start))
+				panic("DONE")
+			}
+
 			m.SetupMiner()
 			m.SendTasks()
 			m.mu.Unlock()
@@ -309,7 +346,7 @@ func (m *Miner) MasterLoop() {
 	}
 }
 
-const POLLING_TIMEOUT = 250 * time.Millisecond
+const POLLING_TIMEOUT = 1 * time.Second
 
 // Poll server for new block templates (i.e. check if another block has been mined.)
 // Runs in one goroutine only.
@@ -317,13 +354,7 @@ func (m *Miner) PollServer() {
 	for {
 		//fmt.Println("TABLES SIZES: ", m.A_size, m.B_size)
 		h, ok := nextBlockTemplate()
-
-		q := 25
-		p := 1
-		i := rand.Intn(q)
-		if i < p {
-			fmt.Println("Parent ID, matching num, A_size: ", h.ParentID, 128-h.Difficulty, m.A_size)
-		}
+		fmt.Println("Parent ID, matching num, A_size: ", h.ParentID, 128-h.Difficulty, m.A_size)
 
 		if !ok {
 			// TODO decide on what behavior is reasonable here
@@ -347,10 +378,105 @@ func (m *Miner) PollServer() {
 }
 
 func main() {
+	f, _ := os.Create("cpu.out")
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
 	StartMiner(Miner{})
 }
 
-func (m *Miner) MineRange(start, end uint64, kill chan struct{}) {
+func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) {
+	seed, seed2 := getSeeds(&m.currentBlock.Header)
+
+	cipher, _ := aes.NewCipher(seed)
+	cipher2, _ := aes.NewCipher(seed2)
+
+	done := false
+
+	num_checked := 0
+	id := rand.Uint64()
+
+	m_buffer := make([]byte, 16)
+	c_buffer := make([]byte, 16)
+
+	for i := start; i < end; i++ {
+		for j := start + 1; j < end; j++ {
+			select {
+			case <-kill:
+				fmt.Println("HEREEEEEEEEEEEEEEE", num_checked)
+				m.pairsChecked[workerIdx] = num_checked
+				return
+			default:
+			}
+
+			binary.BigEndian.PutUint64(m_buffer[8:], uint64(i))
+			cipher.Encrypt(c_buffer, m_buffer)
+			A_i := uint128{
+				low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+				high: binary.BigEndian.Uint64(c_buffer[8:16]),
+			}
+			cipher2.Encrypt(c_buffer, m_buffer)
+			B_i := uint128{
+				low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+				high: binary.BigEndian.Uint64(c_buffer[8:16]),
+			}
+
+			binary.BigEndian.PutUint64(m_buffer[8:], uint64(j))
+			cipher.Encrypt(c_buffer, m_buffer)
+			A_j := uint128{
+				low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+				high: binary.BigEndian.Uint64(c_buffer[8:16]),
+			}
+			cipher2.Encrypt(c_buffer, m_buffer)
+			B_j := uint128{
+				low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+				high: binary.BigEndian.Uint64(c_buffer[8:16]),
+			}
+
+			/*
+				A_i := SeededAES(m_buffer, c_buffer, seed, uint64(i))
+				B_i := SeededAES(m_buffer, c_buffer, seed2, uint64(i))
+
+				A_j := SeededAES(m_buffer, c_buffer, seed, uint64(j))
+				B_j := SeededAES(m_buffer, c_buffer, seed2, uint64(j))
+			*/
+
+			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
+
+			num_checked++
+			if dist < 33 {
+				fmt.Println("DIST: ", dist, time.Since(m.start))
+				fmt.Println("nonces checked", i, j, num_checked, time.Since(m.start), id)
+			}
+
+			if dist < 128-int(m.currentBlock.Header.Difficulty) {
+				fmt.Println("dif:, ", 128-int(m.currentBlock.Header.Difficulty))
+				fmt.Println("DIST: ", dist, time.Since(m.start))
+				m.mu.Lock()
+				m.currentBlock.Header.Nonces[1] = uint64(i)
+				m.currentBlock.Header.Nonces[2] = uint64(j)
+
+				addBlock(m.currentBlock)
+				fmt.Println(m.currentBlock)
+				m.mu.Unlock()
+				done = true
+			}
+
+			if (j % 1000) == 0 {
+				m.pairsChecked[workerIdx] = num_checked
+			}
+
+			if done {
+				m.pairsChecked[workerIdx] = num_checked
+				<-kill
+				return
+			}
+		}
+	}
+	m.pairsChecked[workerIdx] = num_checked
+	<-kill
+}
+
+func (m *Miner) MineRangeOld(workerIdx int, start, end uint64, kill chan struct{}) {
 	seed, seed2 := getSeeds(&m.currentBlock.Header)
 
 	done := false
@@ -358,9 +484,14 @@ func (m *Miner) MineRange(start, end uint64, kill chan struct{}) {
 	num_checked := 0
 	id := rand.Uint64()
 
+	m_buffer := make([]byte, 16)
+	c_buffer := make([]byte, 16)
+
 	for i := start; i < end; i++ {
 		select {
 		case <-kill:
+			fmt.Println("HEREEEEEEEEEEEEEEE", num_checked)
+			m.pairsChecked[workerIdx] = num_checked
 			return
 		default:
 		}
@@ -368,8 +499,8 @@ func (m *Miner) MineRange(start, end uint64, kill chan struct{}) {
 		//fmt.Println("mining nonce: ", i)
 		// Compute A(i), B(i) (since this is our nonce-range).
 		// If tables aren't filled up, we will add them to the tables after.
-		A_i := SeededAES(seed, uint64(i))
-		B_i := SeededAES(seed2, uint64(i))
+		A_i := SeededAES(m_buffer, c_buffer, seed, uint64(i))
+		B_i := SeededAES(m_buffer, c_buffer, seed2, uint64(i))
 
 		checkAgainstA_Tables := func(j, v interface{}) bool {
 			A_j := v.(uint128)
@@ -415,33 +546,14 @@ func (m *Miner) MineRange(start, end uint64, kill chan struct{}) {
 			m.mu.Unlock()
 		}
 
+		m.pairsChecked[workerIdx] = num_checked
+
 		if done {
+			m.pairsChecked[workerIdx] = num_checked
+			<-kill
 			return
 		}
 	}
-}
-
-func testPoW() {
-	id := "a367b8d21c4263baa65e22da2faf52a42ac72f1d02d900473cecfcd40084b163"
-	resp, err := http.Get("http://6857coin.csail.mit.edu/block/" + id)
-	if (err != nil) || !(resp.StatusCode >= 200 && resp.StatusCode <= 299) {
-		fmt.Println("Failed to get block", err)
-	}
-	defer resp.Body.Close()
-
-	b := ExplorerBlock{}
-	json.NewDecoder(resp.Body).Decode(&b)
-
-	fmt.Println(b, id)
-
-	seed, seed2 := getSeeds(&b.Header)
-	A_i := SeededAES(seed, b.Header.Nonces[1])
-	B_i := SeededAES(seed2, b.Header.Nonces[1])
-
-	A_j := SeededAES(seed, b.Header.Nonces[2])
-	B_j := SeededAES(seed2, b.Header.Nonces[2])
-
-	dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
-
-	fmt.Println(dist)
+	m.pairsChecked[workerIdx] = num_checked
+	<-kill
 }
