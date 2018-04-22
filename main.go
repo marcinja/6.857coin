@@ -19,8 +19,8 @@ import (
 )
 
 // Maximum number of elements stored for A and B.
-const SIZE_PER_NONCE = 64    // 2 * 32 bytes one for A and one for B
-const MAX_BYTES = 8000000000 // // TODO: change this on each machine
+const SIZE_PER_NONCE = 64     // 2 * 32 bytes one for A and one for B
+const MAX_BYTES = 12000000000 // // TODO: change this on each machine
 
 const MAX_TABLE_SIZE = (MAX_BYTES / SIZE_PER_NONCE) // 25000
 
@@ -240,6 +240,8 @@ type Miner struct {
 
 	start time.Time
 
+	doneFilling bool
+
 	killChans    []chan struct{}
 	pairsChecked []int
 }
@@ -277,10 +279,10 @@ func (m *Miner) SetupMiner() {
 	m.newBlockChan = make(chan Block, 1)
 	m.start = time.Now()
 
-	m.killChans = make([]chan struct{}, N_WORKERS)
-	m.pairsChecked = make([]int, N_WORKERS)
+	m.killChans = make([]chan struct{}, 2*N_WORKERS)
+	m.pairsChecked = make([]int, 2*N_WORKERS)
 
-	for i := 0; i < N_WORKERS; i++ {
+	for i := 0; i < 2*N_WORKERS; i++ {
 		if GET_RATE {
 			m.killChans[i] = make(chan struct{}, 0)
 		} else {
@@ -293,20 +295,33 @@ func StartMiner(m Miner) {
 	m.SetupMiner()
 	m.A_table = make([]uint128, MAX_TABLE_SIZE)
 	m.B_table = make([]uint128, MAX_TABLE_SIZE)
-	m.FillTables()
-	m.SendTasks()
 	go m.PollServer()
-	m.MasterLoop()
+
+	done := make(chan struct{}, N_WORKERS)
+	go m.FillTables(done)
+
+	m.MasterLoop(done)
+
 }
-func (m *Miner) MasterLoop() {
+
+func (m *Miner) MasterLoop(done chan struct{}) {
 	// Timeout needed to update timestamp.
 	timestamp_timeout := 119 * time.Second
 	timeout := time.NewTimer(timestamp_timeout)
 
 	start := time.Now()
 
+	nDone := 0
 	for {
 		select {
+		case <-done:
+			nDone++
+			if nDone >= N_WORKERS {
+				m.SendTasks()
+				fmt.Println("DONE:", time.Since(start))
+				m.doneFilling = true
+			}
+
 		case <-m.newBlockChan:
 			if GET_RATE {
 				continue
@@ -314,34 +329,58 @@ func (m *Miner) MasterLoop() {
 
 			fmt.Println("\n~~~ NEW BLOCK FOUND ~~~")
 			m.mu.Lock()
-			for i := 0; i < N_WORKERS; i++ {
-				m.killChans[i] <- struct{}{}
+
+			wOffset := 0
+			if m.doneFilling {
+				wOffset = N_WORKERS
 			}
+
+			for i := 0; i < N_WORKERS; i++ {
+				m.killChans[i+wOffset] <- struct{}{}
+			}
+
+			m.doneFilling = false
+
 			m.SetupMiner()
-			m.FillTables()
-			m.SendTasks()
+			done := make(chan struct{}, N_WORKERS)
+			go m.FillTables(done)
+			nDone = 0
+			//			m.SendTasks()
 			m.mu.Unlock()
 			timeout.Reset(timestamp_timeout)
 
 		case <-timeout.C:
 			fmt.Println("\n~~~TIMEOUT EXCEEDED~~~")
 			m.mu.Lock()
-			for i := 0; i < N_WORKERS; i++ {
-				fmt.Println(i)
-				m.killChans[i] <- struct{}{}
+
+			wOffset := 0
+			if m.doneFilling {
+				wOffset = N_WORKERS
 			}
+
+			for i := 0; i < N_WORKERS; i++ {
+				m.killChans[i+wOffset] <- struct{}{}
+			}
+
+			m.doneFilling = false
 
 			if GET_RATE {
 				total := 0
-				for i := 0; i < N_WORKERS; i++ {
+				for i := 0; i < 2*N_WORKERS; i++ {
 					total += m.pairsChecked[i]
 				}
 				fmt.Println("\n\n TOTAL CHECKED after TIME: ", humanize.Comma(int64(total)), time.Since(start))
 			}
 
 			m.SetupMiner()
-			m.FillTables()
-			m.SendTasks()
+			//j			m.FillTables()
+
+			done := make(chan struct{}, N_WORKERS)
+			go m.FillTables(done)
+			nDone = 0
+			//			m.SendTasks()
+
+			//		m.SendTasks()
 			m.mu.Unlock()
 			timeout.Reset(timestamp_timeout)
 		}
@@ -393,32 +432,18 @@ func (m *Miner) SendTasks() {
 	// Iterate over partitions of nonce_space and assign workers.
 	for i := 0; i < N_WORKERS; i++ {
 		fmt.Println("NONCE RANGE: ", i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
-		go m.MineRange(i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, m.killChans[i])
+		go m.MineRange(i+N_WORKERS, MAX_TABLE_SIZE+uint64(i)*N_NONCES, MAX_TABLE_SIZE+uint64((i+1))*N_NONCES, m.killChans[i+N_WORKERS])
 	}
 
 }
 
-func (m *Miner) FillTables() {
+func (m *Miner) FillTables(done chan struct{}) {
 	split := MAX_TABLE_SIZE / N_WORKERS
 
-	done := make(chan struct{}, N_WORKERS)
-
-	start := time.Now()
 	for i := 0; i < N_WORKERS; i++ {
-		go m.FillTableRange(i*split, (i+1)*split, done)
+		go m.FillTableRange(i, i*split, (i+1)*split, done, m.killChans[i])
 	}
 
-	nDone := 0
-	for {
-		<-done
-		nDone++
-		if nDone >= N_WORKERS {
-			break
-		}
-	}
-
-	fmt.Println("DONE:", time.Since(start))
-	time.Sleep(10 * time.Second)
 }
 
 func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) {
@@ -474,6 +499,17 @@ func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) 
 				done = true
 				break
 			}
+
+			const CHECK_EVERY_N = 10000
+			if j%CHECK_EVERY_N == 0 {
+				select {
+				case <-kill:
+					fmt.Println("Worker killed: ", num_checked, i)
+					m.pairsChecked[workerIdx] = num_checked
+					return
+				default:
+				}
+			}
 		}
 
 		if done {
@@ -485,7 +521,7 @@ func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) 
 	}
 }
 
-func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}) {
+func (m *Miner) FillTableRange(workerIdx, start, end int, doneCh, kill chan struct{}) {
 	seed, seed2 := getSeeds(&m.currentBlock.Header)
 
 	cipher, _ := aes.NewCipher(seed)
@@ -494,7 +530,18 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}) {
 	m_buffer := make([]byte, 16)
 	c_buffer := make([]byte, 16)
 
+	done := false
+	num_checked := 0
+
 	for i := uint64(start); i < uint64(end); i++ {
+		select {
+		case <-kill:
+			fmt.Println("Worker killed: ", num_checked, i)
+			m.pairsChecked[workerIdx] = num_checked
+			return
+		default:
+		}
+
 		binary.BigEndian.PutUint64(m_buffer[8:], uint64(i))
 		cipher.Encrypt(c_buffer, m_buffer)
 		A_i := uint128{
@@ -509,6 +556,43 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}) {
 
 		m.A_table[i] = A_i
 		m.B_table[i] = B_i
+
+		for j := start; j < int(i); j++ {
+			if i == uint64(j) {
+				continue
+			}
+			A_j := m.A_table[j]
+			B_j := m.B_table[j]
+
+			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
+			if dist < 128-int(m.currentBlock.Header.Difficulty) {
+				fmt.Println("HERE SOMEHOW", A_i, B_i, B_j, A_j, num_checked)
+				m.mu.Lock()
+				m.currentBlock.Header.Nonces[1] = uint64(i)
+				m.currentBlock.Header.Nonces[2] = uint64(j)
+
+				addBlock(m.currentBlock)
+				fmt.Println(m.currentBlock)
+				m.mu.Unlock()
+				break
+			}
+
+			const CHECK_EVERY_N = 10000
+			if j%CHECK_EVERY_N == 0 {
+				select {
+				case <-kill:
+					fmt.Println("Worker killed: ", num_checked, i)
+					m.pairsChecked[workerIdx] = num_checked
+					return
+				default:
+				}
+			}
+		}
+		num_checked += int(i)
+		if done {
+			break
+		}
+
 	}
 
 	doneCh <- struct{}{}
