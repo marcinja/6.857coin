@@ -286,7 +286,7 @@ func (m *Miner) SetupMiner() {
 	for i := 0; i < N_WORKERS; i++ {
 		if GET_RATE {
 			m.killChans[i] = make(chan struct{}, 0)
-			m.fillKill = make(chan struct{}, 0)
+			m.fillKill = make(chan struct{}, 1)
 		} else {
 			m.killChans[i] = make(chan struct{}, 1)
 			m.fillKill = make(chan struct{}, 1)
@@ -320,10 +320,10 @@ func (m *Miner) MasterLoop() {
 			fmt.Println("\n~~~ NEW BLOCK FOUND ~~~")
 			m.mu.Lock()
 
+			m.fillKill <- struct{}{}
 			for i := 0; i < N_WORKERS; i++ {
 				m.killChans[i] <- struct{}{}
 			}
-			m.fillKill <- struct{}{}
 
 			m.SetupMiner()
 			m.FillTables()
@@ -334,11 +334,12 @@ func (m *Miner) MasterLoop() {
 		case <-timeout.C:
 			fmt.Println("\n~~~TIMEOUT EXCEEDED~~~")
 			m.mu.Lock()
+
+			m.fillKill <- struct{}{}
 			for i := 0; i < N_WORKERS; i++ {
 				fmt.Println(i)
 				m.killChans[i] <- struct{}{}
 			}
-			m.fillKill <- struct{}{}
 
 			if GET_RATE {
 				total := 0
@@ -550,7 +551,7 @@ func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) 
 				break
 			}
 
-			const CHECK_EVERY_N = 100000
+			const CHECK_EVERY_N = 10000
 			if j%CHECK_EVERY_N == 0 {
 				select {
 				case <-kill:
@@ -613,6 +614,4 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}, last bool) 
 	if !last {
 		doneCh <- struct{}{}
 	}
-
-	<-m.fillKill
 }
