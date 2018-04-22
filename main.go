@@ -243,6 +243,7 @@ type Miner struct {
 	start time.Time
 
 	killChans    []chan struct{}
+	fillKill     chan struct{}
 	pairsChecked []int
 }
 
@@ -285,8 +286,10 @@ func (m *Miner) SetupMiner() {
 	for i := 0; i < N_WORKERS; i++ {
 		if GET_RATE {
 			m.killChans[i] = make(chan struct{}, 0)
+			m.fillKill = make(chan struct{}, 0)
 		} else {
 			m.killChans[i] = make(chan struct{}, 1)
+			m.fillKill = make(chan struct{}, 1)
 		}
 	}
 }
@@ -316,9 +319,12 @@ func (m *Miner) MasterLoop() {
 
 			fmt.Println("\n~~~ NEW BLOCK FOUND ~~~")
 			m.mu.Lock()
+
 			for i := 0; i < N_WORKERS; i++ {
 				m.killChans[i] <- struct{}{}
 			}
+			m.fillKill <- struct{}{}
+
 			m.SetupMiner()
 			m.FillTables()
 			m.SendTasks()
@@ -332,6 +338,7 @@ func (m *Miner) MasterLoop() {
 				fmt.Println(i)
 				m.killChans[i] <- struct{}{}
 			}
+			m.fillKill <- struct{}{}
 
 			if GET_RATE {
 				total := 0
@@ -542,6 +549,17 @@ func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) 
 				done = true
 				break
 			}
+
+			const CHECK_EVERY_N = 100000
+			if j%CHECK_EVERY_N == 0 {
+				select {
+				case <-kill:
+					fmt.Println("Worker killed: ", num_checked, i)
+					m.pairsChecked[workerIdx] = num_checked
+					return
+				default:
+				}
+			}
 		}
 
 		if done {
@@ -582,8 +600,19 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}, last bool) 
 
 		if last && (int(i)%UPDATE_INTERVAL == 0) {
 			m.numFilled = int(i)
+
+			select {
+			case <-m.fillKill:
+				fmt.Println("HEE")
+				return
+			default:
+			}
 		}
 	}
 
-	doneCh <- struct{}{}
+	if !last {
+		doneCh <- struct{}{}
+	}
+
+	<-m.fillKill
 }
