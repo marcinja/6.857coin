@@ -235,6 +235,8 @@ type Miner struct {
 	currentBlock Block // currentBlock is the block being mined.
 	newBlockChan chan Block
 
+	numFilled int
+
 	A_table []uint128
 	B_table []uint128
 
@@ -393,20 +395,23 @@ func (m *Miner) SendTasks() {
 	// Iterate over partitions of nonce_space and assign workers.
 	for i := 0; i < N_WORKERS; i++ {
 		fmt.Println("NONCE RANGE: ", i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES)
-		go m.MineRange(i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, m.killChans[i])
+		go m.MineRangeUpdateable(i, uint64(i)*N_NONCES, uint64((i+1))*N_NONCES, m.killChans[i])
 	}
 
 }
 
 func (m *Miner) FillTables() {
-	split := MAX_TABLE_SIZE / N_WORKERS
+	split := (MAX_TABLE_SIZE / N_WORKERS) / 8
 
 	done := make(chan struct{}, N_WORKERS)
 
 	start := time.Now()
 	for i := 0; i < N_WORKERS; i++ {
-		go m.FillTableRange(i*split, (i+1)*split, done)
+		go m.FillTableRange(i*split, (i+1)*split, done, false)
 	}
+
+	// Fill rest of the table with one thread.
+	go m.FillTableRange((N_WORKERS)*split, MAX_TABLE_SIZE, done, true)
 
 	nDone := 0
 	for {
@@ -417,8 +422,71 @@ func (m *Miner) FillTables() {
 		}
 	}
 
-	fmt.Println("DONE:", time.Since(start))
-	time.Sleep(10 * time.Second)
+	fmt.Println("Done filling first section:", time.Since(start))
+}
+
+func (m *Miner) MineRangeUpdateable(workerIdx int, start, end uint64, kill chan struct{}) {
+	seed, seed2 := getSeeds(&m.currentBlock.Header)
+
+	cipher, _ := aes.NewCipher(seed)
+	cipher2, _ := aes.NewCipher(seed2)
+
+	m_buffer := make([]byte, 16)
+	c_buffer := make([]byte, 16)
+
+	done := false
+	num_checked := 0
+
+	for i := start; i < end; i++ {
+		select {
+		case <-kill:
+			fmt.Println("Worker killed: ", num_checked, i)
+			m.pairsChecked[workerIdx] = num_checked
+			return
+		default:
+		}
+
+		binary.BigEndian.PutUint64(m_buffer[8:], uint64(i))
+		cipher.Encrypt(c_buffer, m_buffer)
+		A_i := uint128{
+			low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+			high: binary.BigEndian.Uint64(c_buffer[8:16]),
+		}
+		cipher2.Encrypt(c_buffer, m_buffer)
+		B_i := uint128{
+			low:  binary.BigEndian.Uint64(c_buffer[0:8]),
+			high: binary.BigEndian.Uint64(c_buffer[8:16]),
+		}
+
+		for j := 0; j < m.numFilled; j++ {
+			if i == uint64(j) {
+				continue
+			}
+			A_j := m.A_table[j]
+			B_j := m.B_table[j]
+
+			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
+			if dist < 128-int(m.currentBlock.Header.Difficulty) {
+				fmt.Println("HERE SOMEHOW", A_i, B_i, B_j, A_j, num_checked)
+				m.mu.Lock()
+				m.currentBlock.Header.Nonces[1] = uint64(i)
+				m.currentBlock.Header.Nonces[2] = uint64(j)
+
+				addBlock(m.currentBlock)
+				fmt.Println(m.currentBlock)
+				m.mu.Unlock()
+				done = true
+				break
+			}
+		}
+
+		if done {
+			m.pairsChecked[workerIdx] = num_checked
+			<-kill
+			return
+		}
+		num_checked += MAX_TABLE_SIZE
+	}
 }
 
 func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) {
@@ -485,7 +553,9 @@ func (m *Miner) MineRange(workerIdx int, start, end uint64, kill chan struct{}) 
 	}
 }
 
-func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}) {
+const UPDATE_INTERVAL = 100000
+
+func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}, last bool) {
 	seed, seed2 := getSeeds(&m.currentBlock.Header)
 
 	cipher, _ := aes.NewCipher(seed)
@@ -509,6 +579,10 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}) {
 
 		m.A_table[i] = A_i
 		m.B_table[i] = B_i
+
+		if last && (int(i)%UPDATE_INTERVAL == 0) {
+			m.numFilled = int(i)
+		}
 	}
 
 	doneCh <- struct{}{}
