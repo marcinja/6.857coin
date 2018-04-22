@@ -466,44 +466,46 @@ func (m *Miner) MineRangeUpdateable(workerIdx int, start, end uint64, kill chan 
 			high: binary.BigEndian.Uint64(c_buffer[8:16]),
 		}
 
-		for j := 0; j < m.numFilled; j++ {
-			if i == uint64(j) {
-				continue
-			}
-			A_j := m.A_table[j]
-			B_j := m.B_table[j]
+		const CHECK_EVERY_N = 25000
+		N_FILLED := m.numFilled
 
-			dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
-			if dist < 128-int(m.currentBlock.Header.Difficulty) {
-				fmt.Println("HERE SOMEHOW", A_i, B_i, B_j, A_j, num_checked)
-				m.mu.Lock()
-				m.currentBlock.Header.Nonces[1] = uint64(i)
-				m.currentBlock.Header.Nonces[2] = uint64(j)
+	MIDDLE:
+		for k := 0; k < (N_FILLED / CHECK_EVERY_N); k++ {
+			for j := k; j < k+CHECK_EVERY_N; j++ {
+				if i == uint64(j) {
+					continue
+				}
+				A_j := m.A_table[j]
+				B_j := m.B_table[j]
 
-				addBlock(m.currentBlock)
-				fmt.Println(m.currentBlock)
-				m.mu.Unlock()
-				done = true
-				break
-			}
+				dist := HammingDistance(Add(A_i, B_j), Add(A_j, B_i))
+				if dist < 128-int(m.currentBlock.Header.Difficulty) {
+					fmt.Println("HERE SOMEHOW", A_i, B_i, B_j, A_j, num_checked)
+					m.mu.Lock()
+					m.currentBlock.Header.Nonces[1] = uint64(i)
+					m.currentBlock.Header.Nonces[2] = uint64(j)
 
-			const CHECK_EVERY_N = 25000
-			if j%CHECK_EVERY_N == 0 {
-				select {
-				case <-kill:
-					fmt.Println("Worker killed: ", num_checked, i)
-					m.pairsChecked[workerIdx] = num_checked
-					return
-				default:
+					addBlock(m.currentBlock)
+					fmt.Println(m.currentBlock)
+					m.mu.Unlock()
+					done = true
+					break MIDDLE
 				}
 			}
+			select {
+			case <-kill:
+				fmt.Println("Worker killed: ", num_checked, i)
+				m.pairsChecked[workerIdx] = num_checked
+				return
+			default:
+			}
 		}
-
-		num_checked += MAX_TABLE_SIZE
+		num_checked += N_FILLED
 		if done {
 			m.pairsChecked[workerIdx] = num_checked
 			<-kill
 			return
+
 		}
 	}
 }
@@ -540,7 +542,7 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}, last bool) 
 
 			select {
 			case <-m.fillKill:
-				fmt.Println("HEE")
+				fmt.Println("Killed filler worker.")
 				return
 			default:
 			}
@@ -549,5 +551,7 @@ func (m *Miner) FillTableRange(start, end int, doneCh chan struct{}, last bool) 
 
 	if !last {
 		doneCh <- struct{}{}
+	} else {
+		<-m.fillKill
 	}
 }
